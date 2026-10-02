@@ -103,42 +103,29 @@ class CircuitBreaker:
     def __init__(self, failure_threshold=3, cooldown=5.0):
         self.failure_threshold = failure_threshold
         self.cooldown = cooldown
-        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
         self.consecutive_failures = 0
         self.opened_at = 0.0
-        self.half_open_in_flight = False
         self.lock = threading.Lock()
 
     def can_attempt(self) -> bool:
         with self.lock:
-            if self.state == "CLOSED":
+            if self.consecutive_failures < self.failure_threshold:
                 return True
             now = time.time()
-            if self.state == "OPEN":
-                if now - self.opened_at >= self.cooldown:
-                    self.state = "HALF_OPEN"
-                    self.half_open_in_flight = True
-                    return True
-                return False
-            if self.state == "HALF_OPEN":
-                if not self.half_open_in_flight:
-                    self.half_open_in_flight = True
-                    return True
-                return False
+            if now - self.opened_at >= self.cooldown:
+                self.opened_at = now
+                return True
             return False
 
     def record_success(self):
         with self.lock:
-            self.state = "CLOSED"
             self.consecutive_failures = 0
-            self.half_open_in_flight = False
+            self.opened_at = 0.0
 
     def record_failure(self):
         with self.lock:
             self.consecutive_failures += 1
-            self.half_open_in_flight = False
-            if self.state == "HALF_OPEN" or self.consecutive_failures >= self.failure_threshold:
-                self.state = "OPEN"
+            if self.consecutive_failures >= self.failure_threshold:
                 self.opened_at = time.time()
 
 
@@ -152,6 +139,7 @@ def reserve_inventory(order_id, items):
     }).encode("utf-8")
     req = urllib.request.Request(f"{INVENTORY_URL}/reservations", data=body, method="POST")
     req.add_header("Content-Type", "application/json")
+    req.add_header("Connection", "close")
     with urllib.request.urlopen(req, timeout=0.5) as resp:
         if resp.status not in (200, 201):
             raise RuntimeError(f"Inventory reservation returned status {resp.status}")
@@ -162,6 +150,7 @@ def release_inventory(order_id):
         f"{INVENTORY_URL}/reservations/{urllib.parse.quote(order_id)}",
         method="DELETE"
     )
+    req.add_header("Connection", "close")
     try:
         with urllib.request.urlopen(req, timeout=0.5):
             pass
@@ -172,6 +161,7 @@ def release_inventory(order_id):
 def check_payment_charges(order_id, timeout=0.5):
     url = f"{PAYMENT_URL}/payments?order_id={urllib.parse.quote(order_id)}"
     req = urllib.request.Request(url, method="GET")
+    req.add_header("Connection", "close")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
@@ -192,6 +182,7 @@ def call_payment_charge(order_id, amount_cents, timeout=0.35):
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Idempotency-Key", order_id)
+    req.add_header("Connection", "close")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status in (200, 201):
@@ -240,7 +231,7 @@ def get_order(order_id):
     return {"id": row[0], "status": row[1], "amount_cents": row[2]}
 
 
-def get_pending_orders(limit=25):
+def get_pending_orders(limit=100):
     with pool.connection() as conn:
         rows = conn.execute(
             "SELECT id, amount_cents FROM orders WHERE status = 'pending' ORDER BY created_at ASC LIMIT %s",
@@ -252,10 +243,8 @@ def get_pending_orders(limit=25):
 def background_worker_loop():
     while True:
         try:
-            time.sleep(0.3)
-            if not breaker.can_attempt():
-                continue
-            pending = get_pending_orders(limit=25)
+            time.sleep(0.2)
+            pending = get_pending_orders(limit=100)
             if not pending:
                 continue
             for order_id, amount_cents in pending:
@@ -293,7 +282,10 @@ def background_worker_loop():
                     else:
                         breaker.record_failure()
                         break
-                elif res in ("timeout", "error_500"):
+                elif res == "error_500":
+                    breaker.record_failure()
+                    time.sleep(0.05)
+                elif res == "timeout":
                     breaker.record_failure()
                     break
         except Exception as e:
